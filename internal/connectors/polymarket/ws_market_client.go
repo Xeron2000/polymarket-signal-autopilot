@@ -1,6 +1,7 @@
 package polymarket
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -34,7 +35,7 @@ func DefaultReconnectPolicy() WSReconnectPolicy {
 	return WSReconnectPolicy{
 		BaseDelay:   250 * time.Millisecond,
 		MaxDelay:    5 * time.Second,
-		MaxAttempts: 8,
+		MaxAttempts: 0,
 	}
 }
 
@@ -111,7 +112,13 @@ func (c *WSMarketClient) Stream(ctx context.Context, assetIDs []string) (<-chan 
 			}
 
 			_ = conn.Close()
-			return
+			if ctx.Err() != nil {
+				return
+			}
+			if !sleepBackoff(ctx, attempt, c.reconnectPolicy) {
+				return
+			}
+			attempt++
 		}
 	}()
 
@@ -142,20 +149,22 @@ func (c *WSMarketClient) readLoop(ctx context.Context, conn *websocket.Conn, upd
 			continue
 		}
 
-		update, ok, err := decodeMarketUpdate(raw)
+		decoded, err := decodeMarketUpdates(raw)
 		if err != nil {
 			emitErr(ctx, errs, err)
 			continue
 		}
-		if !ok {
+		if len(decoded) == 0 {
 			continue
 		}
 
-		select {
-		case <-ctx.Done():
-			close(pingDone)
-			return nil
-		case updates <- update:
+		for _, update := range decoded {
+			select {
+			case <-ctx.Done():
+				close(pingDone)
+				return nil
+			case updates <- update:
+			}
 		}
 	}
 }
@@ -192,23 +201,88 @@ func (c *WSMarketClient) writeSubscribe(conn *websocket.Conn, assetIDs []string)
 	return nil
 }
 
-func decodeMarketUpdate(raw []byte) (WSMarketUpdate, bool, error) {
+func decodeMarketUpdates(raw []byte) ([]WSMarketUpdate, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, nil
+	}
+
+	if trimmed[0] == '[' {
+		var entries []json.RawMessage
+		if err := json.Unmarshal(trimmed, &entries); err != nil {
+			return nil, fmt.Errorf("decode market ws update: %w", err)
+		}
+
+		updates := make([]WSMarketUpdate, 0, len(entries))
+		for _, entry := range entries {
+			decoded, err := decodeMarketUpdateEnvelope(entry)
+			if err != nil {
+				return nil, err
+			}
+			updates = append(updates, decoded...)
+		}
+		return updates, nil
+	}
+
+	return decodeMarketUpdateEnvelope(trimmed)
+}
+
+func decodeMarketUpdateEnvelope(raw []byte) ([]WSMarketUpdate, error) {
 	var envelope struct {
-		AssetID  string          `json:"asset_id"`
-		AssetIDs []string        `json:"asset_ids"`
-		Type     string          `json:"type"`
-		Payload  json.RawMessage `json:"payload"`
+		AssetID      string          `json:"asset_id"`
+		AssetIDs     []string        `json:"asset_ids"`
+		Type         string          `json:"type"`
+		EventType    string          `json:"event_type"`
+		Payload      json.RawMessage `json:"payload"`
+		PriceChanges []struct {
+			AssetID        string `json:"asset_id"`
+			Price          any    `json:"price"`
+			Mid            any    `json:"mid"`
+			BestBid        any    `json:"best_bid"`
+			Bid            any    `json:"bid"`
+			LastTradePrice any    `json:"last_trade_price"`
+			BestAsk        any    `json:"best_ask"`
+		} `json:"price_changes"`
 	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return WSMarketUpdate{}, false, fmt.Errorf("decode market ws update: %w", err)
+		return nil, fmt.Errorf("decode market ws update: %w", err)
+	}
+
+	eventType := envelope.Type
+	if eventType == "" {
+		eventType = envelope.EventType
+	}
+	if eventType == "" {
+		return nil, nil
+	}
+
+	if len(envelope.PriceChanges) > 0 {
+		updates := make([]WSMarketUpdate, 0, len(envelope.PriceChanges))
+		for _, change := range envelope.PriceChanges {
+			if change.AssetID == "" {
+				continue
+			}
+			payload, err := json.Marshal(change)
+			if err != nil {
+				continue
+			}
+			updates = append(updates, WSMarketUpdate{
+				AssetID: change.AssetID,
+				Type:    eventType,
+				Payload: payload,
+			})
+		}
+		if len(updates) > 0 {
+			return updates, nil
+		}
 	}
 
 	assetID := envelope.AssetID
 	if assetID == "" && len(envelope.AssetIDs) > 0 {
 		assetID = envelope.AssetIDs[0]
 	}
-	if envelope.Type == "" || assetID == "" {
-		return WSMarketUpdate{}, false, nil
+	if assetID == "" {
+		return nil, nil
 	}
 
 	payload := envelope.Payload
@@ -216,7 +290,7 @@ func decodeMarketUpdate(raw []byte) (WSMarketUpdate, bool, error) {
 		payload = raw
 	}
 
-	return WSMarketUpdate{AssetID: assetID, Type: envelope.Type, Payload: payload}, true, nil
+	return []WSMarketUpdate{{AssetID: assetID, Type: eventType, Payload: payload}}, nil
 }
 
 func ShouldRetryHTTPStatus(statusCode int) bool {

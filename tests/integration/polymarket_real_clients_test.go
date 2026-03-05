@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -143,5 +144,184 @@ func TestWSMarketClientSubscribeAndReceivePublicFeed(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("timeout waiting for websocket update")
+	}
+}
+
+func TestWSMarketClientReceiveEventTypePriceChanges(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade failed: %v", err)
+		}
+		defer conn.Close()
+
+		_, subscribeMsg, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read subscribe message failed: %v", err)
+		}
+		if !strings.Contains(string(subscribeMsg), "assets_ids") || !strings.Contains(string(subscribeMsg), "market") {
+			t.Fatalf("unexpected subscribe payload: %s", string(subscribeMsg))
+		}
+
+		err = conn.WriteMessage(websocket.TextMessage, []byte(`{
+			"event_type":"price_change",
+			"market":"m1",
+			"price_changes":[
+				{"asset_id":"tok1","price":"0.49","best_bid":"0.49","best_ask":"0.51"},
+				{"asset_id":"tok2","price":"0.51","best_bid":"0.51","best_ask":"0.53"}
+			]
+		}`))
+		if err != nil {
+			t.Fatalf("write market update failed: %v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	client := polymarket.NewWSMarketClient(wsURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	updates, errs := client.Stream(ctx, []string{"tok1", "tok2"})
+	seen := map[string]bool{}
+
+	for len(seen) < 2 {
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatalf("unexpected stream error: %v", err)
+			}
+		case msg := <-updates:
+			if msg.Type != "price_change" {
+				t.Fatalf("unexpected ws update type: %+v", msg)
+			}
+			if msg.AssetID != "tok1" && msg.AssetID != "tok2" {
+				t.Fatalf("unexpected ws asset id: %+v", msg)
+			}
+
+			var payload map[string]any
+			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+				t.Fatalf("decode payload failed: %v", err)
+			}
+			if _, ok := payload["price"]; !ok {
+				t.Fatalf("expected price in payload, got %+v", payload)
+			}
+			seen[msg.AssetID] = true
+		case <-ctx.Done():
+			t.Fatal("timeout waiting for price_change websocket updates")
+		}
+	}
+}
+
+func TestWSMarketClientHandlesArrayEnvelopeMessages(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade failed: %v", err)
+		}
+		defer conn.Close()
+
+		_, _, err = conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read subscribe message failed: %v", err)
+		}
+
+		err = conn.WriteMessage(websocket.TextMessage, []byte(`[
+			{
+				"event_type": "price_change",
+				"market": "m1",
+				"price_changes": [
+					{"asset_id":"tok1","price":"0.49","best_bid":"0.49","best_ask":"0.51"}
+				]
+			}
+		]`))
+		if err != nil {
+			t.Fatalf("write array market update failed: %v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	client := polymarket.NewWSMarketClient(wsURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	updates, errs := client.Stream(ctx, []string{"tok1"})
+
+	select {
+	case err := <-errs:
+		if err != nil {
+			t.Fatalf("expected array envelope decode success, got stream error: %v", err)
+		}
+	case msg := <-updates:
+		if msg.AssetID != "tok1" || msg.Type != "price_change" {
+			t.Fatalf("unexpected ws update from array envelope: %+v", msg)
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for array envelope update")
+	}
+}
+
+func TestWSMarketClientReconnectsAfterCleanServerClose(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	var connections atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade failed: %v", err)
+		}
+		defer conn.Close()
+
+		_, _, err = conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read subscribe message failed: %v", err)
+		}
+
+		switch connections.Add(1) {
+		case 1:
+			return
+		case 2:
+			err = conn.WriteMessage(websocket.TextMessage, []byte(`{"asset_id":"tok1","type":"book","payload":{"bid":0.51}}`))
+			if err != nil {
+				t.Fatalf("write market update failed: %v", err)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	client := polymarket.NewWSMarketClient(wsURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	updates, errs := client.Stream(ctx, []string{"tok1"})
+
+	for {
+		select {
+		case <-errs:
+			continue
+		case msg := <-updates:
+			if msg.AssetID != "tok1" || msg.Type != "book" {
+				t.Fatalf("unexpected ws update after reconnect: %+v", msg)
+			}
+			goto done
+		case <-ctx.Done():
+			t.Fatal("timeout waiting for websocket update after reconnect")
+		}
+	}
+
+done:
+
+	if got := connections.Load(); got < 2 {
+		t.Fatalf("expected reconnect with at least 2 connections, got %d", got)
 	}
 }
