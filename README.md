@@ -87,6 +87,25 @@ docker build --target api -t polymarket-signal-api:local .
 docker build --target worker -t polymarket-signal-worker:local .
 ```
 
+## GitHub Actions 自动构建镜像
+
+仓库内置工作流：`.github/workflows/docker.yml`
+
+- PR：仅构建（不推送）
+- Push 到 `main` / `master` 和 `v*` tag：构建并推送到 GHCR
+
+镜像命名规则：
+
+- `ghcr.io/<owner>/<repo>-api:<tag>`
+- `ghcr.io/<owner>/<repo>-worker:<tag>`
+
+例如当前仓库：
+
+```bash
+docker pull ghcr.io/xeron2000/polymarket-signal-autopilot-api:main
+docker pull ghcr.io/xeron2000/polymarket-signal-autopilot-worker:main
+```
+
 ## 非 Docker 运行（Go 本地）
 
 ### 1) 准备
