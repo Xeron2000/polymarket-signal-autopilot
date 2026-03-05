@@ -61,12 +61,15 @@ services:
       POLY_ASSET_IDS: "${POLY_ASSET_IDS:-TOKEN_ID_1,TOKEN_ID_2}"
       ARB_ASSET_A: "${ARB_ASSET_A:-TOKEN_ID_1}"
       ARB_ASSET_B: "${ARB_ASSET_B:-TOKEN_ID_2}"
+      ARB_ASSET_A_URL: "${ARB_ASSET_A_URL:-}"
+      ARB_ASSET_B_URL: "${ARB_ASSET_B_URL:-}"
       POLY_WS_URL: "${POLY_WS_URL:-wss://ws-subscriptions-clob.polymarket.com/ws/market}"
       POLY_CLOB_URL: "${POLY_CLOB_URL:-https://clob.polymarket.com}"
       WORKER_OPS_ADDR: ":9091"
       AUTO_EXECUTE: "${AUTO_EXECUTE:-false}"
       TG_BOT_TOKEN: "${TG_BOT_TOKEN:-}"
       TG_CHAT_ID: "${TG_CHAT_ID:-}"
+      SIGNAL_NOTIFY_COOLDOWN: "${SIGNAL_NOTIFY_COOLDOWN:-2m}"
     ports:
       - "${WORKER_OPS_PORT:-9091}:9091"
     restart: unless-stopped
