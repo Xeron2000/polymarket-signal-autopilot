@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"polymarket-signal/internal/connectors/polymarket"
@@ -72,10 +73,15 @@ type AutoPilotConfig struct {
 	AnomalySeverityMedium   float64
 	AnomalySeverityHigh     float64
 	AnomalyAlertMinSeverity AnomalySeverity
+
+	SignalNotifyCooldown time.Duration
 }
 
 type AutoPilot struct {
 	cfg AutoPilotConfig
+
+	notifyMu         sync.Mutex
+	lastSignalNotify map[string]time.Time
 }
 
 func NewAutoPilot(cfg AutoPilotConfig) *AutoPilot {
@@ -109,7 +115,13 @@ func NewAutoPilot(cfg AutoPilotConfig) *AutoPilot {
 	if normalizeAnomalySeverity(string(cfg.AnomalyAlertMinSeverity)) == "" {
 		cfg.AnomalyAlertMinSeverity = AnomalySeverityMedium
 	}
-	return &AutoPilot{cfg: cfg}
+	if cfg.SignalNotifyCooldown <= 0 {
+		cfg.SignalNotifyCooldown = 2 * time.Minute
+	}
+	return &AutoPilot{
+		cfg:              cfg,
+		lastSignalNotify: make(map[string]time.Time),
+	}
 }
 
 func (a *AutoPilot) Run(ctx context.Context, assetIDs []string) error {
@@ -142,7 +154,7 @@ func (a *AutoPilot) Run(ctx context.Context, assetIDs []string) error {
 			}
 			if err != nil && ctx.Err() == nil {
 				a.cfg.Telemetry.RecordStreamError()
-				a.cfg.OpsAlerts.Emit(ctx, "market_stream_error", fmt.Sprintf("⚠️ market stream error\nerror=%s", err.Error()))
+				a.cfg.OpsAlerts.Emit(ctx, "market_stream_error", formatMarketStreamErrorAlert(err))
 				continue
 			}
 		case update, ok := <-updates:
@@ -207,14 +219,7 @@ func (a *AutoPilot) handleUpdate(ctx context.Context, update polymarket.WSMarket
 			a.cfg.OpsAlerts.Emit(
 				ctx,
 				fmt.Sprintf("anomaly_%s", anomaly.Severity),
-				fmt.Sprintf(
-					"⚠️ anomaly severity alert\nseverity=%s\nasset=%s\nreason=%s\nspread=%.4f\nconfidence=%.4f",
-					anomaly.Severity,
-					signal.AssetID,
-					signal.Reason,
-					anomaly.Spread,
-					signal.Confidence,
-				),
+				formatAnomalyAlertText(signal, anomaly),
 			)
 		}
 
@@ -473,18 +478,10 @@ func (a *AutoPilot) notify(ctx context.Context, signal strategy.Signal, stage st
 	if a.cfg.Notifier == nil {
 		return
 	}
-	severity := signalSeverityFromMetadata(signal)
-	spread := readSignalSpread(signal.Metadata)
-	text := fmt.Sprintf(
-		"📈 %s %s\nasset=%s\nreason=%s\nseverity=%s\nconfidence=%.4f\nspread=%.4f",
-		stage,
-		signal.Action,
-		signal.AssetLabel,
-		signal.Reason,
-		severity,
-		signal.Confidence,
-		spread,
-	)
+	if a.shouldSuppressSignalNotify(stage, signal) {
+		return
+	}
+	text := formatSignalNotificationText(stage, signal)
 	messageID, err := a.cfg.Notifier.Send(ctx, AlertMessage{Target: signal.AssetID, Text: text})
 
 	status := "sent"
@@ -505,6 +502,226 @@ func (a *AutoPilot) notify(ctx context.Context, signal strategy.Signal, stage st
 	})
 
 	_ = messageID
+}
+
+func (a *AutoPilot) shouldSuppressSignalNotify(stage string, signal strategy.Signal) bool {
+	if strings.ToLower(strings.TrimSpace(stage)) != "signal" {
+		return false
+	}
+	if a.cfg.SignalNotifyCooldown <= 0 {
+		return false
+	}
+
+	severity := signalSeverityFromMetadata(signal)
+	key := fmt.Sprintf(
+		"%s|%s|%s|%s|%s",
+		"signal",
+		strings.TrimSpace(signal.AssetID),
+		strings.ToUpper(strings.TrimSpace(signal.Action)),
+		strings.TrimSpace(signal.Reason),
+		string(severity),
+	)
+
+	now := time.Now().UTC()
+	a.notifyMu.Lock()
+	defer a.notifyMu.Unlock()
+
+	if last, ok := a.lastSignalNotify[key]; ok && now.Sub(last) < a.cfg.SignalNotifyCooldown {
+		return true
+	}
+	a.lastSignalNotify[key] = now
+	return false
+}
+
+func formatSignalNotificationText(stage string, signal strategy.Signal) string {
+	severity := signalSeverityFromMetadata(signal)
+	spread := readSignalSpread(signal.Metadata)
+	confidencePercent := clampConfidencePercent(signal.Confidence)
+	marketURL := readSignalMarketURL(signal.Metadata)
+
+	lines := []string{
+		fmt.Sprintf("📈 信号提醒（%s）", humanizeStage(stage)),
+		fmt.Sprintf("方向：%s", humanizeAction(signal.Action)),
+		fmt.Sprintf("标的：%s", formatAssetDisplay(signal.AssetLabel, signal.AssetID)),
+		fmt.Sprintf("触发原因：%s", humanizeReason(signal.Reason)),
+		fmt.Sprintf("风险等级：%s", humanizeSeverity(severity)),
+		fmt.Sprintf("置信度：%.2f%%", confidencePercent),
+		fmt.Sprintf("价差幅度：%.4f", spread),
+	}
+	if marketURL != "" {
+		lines = append(lines, fmt.Sprintf("查看市场：%s", marketURL))
+	}
+	lines = append(lines, "建议：该信号仅供参考，请结合仓位与风控决策。")
+
+	return strings.Join(lines, "\n")
+}
+
+func formatAnomalyAlertText(signal strategy.Signal, anomaly AnomalyEvent) string {
+	confidencePercent := clampConfidencePercent(anomaly.Confidence)
+	assetLabel := formatAssetDisplay(anomaly.AssetLabel, anomaly.AssetID)
+	if assetLabel == "未知标的" {
+		assetLabel = formatAssetDisplay(signal.AssetLabel, signal.AssetID)
+	}
+	marketURL := readSignalMarketURL(signal.Metadata)
+
+	lines := []string{
+		"⚠️ 异常波动预警",
+		fmt.Sprintf("等级：%s", humanizeSeverity(anomaly.Severity)),
+		fmt.Sprintf("标的：%s", assetLabel),
+		fmt.Sprintf("触发原因：%s", humanizeReason(anomaly.Reason)),
+		fmt.Sprintf("当前价差：%.4f", anomaly.Spread),
+		fmt.Sprintf("置信度：%.2f%%", confidencePercent),
+	}
+	if marketURL != "" {
+		lines = append(lines, fmt.Sprintf("查看市场：%s", marketURL))
+	}
+	lines = append(lines, "建议：波动放大，注意仓位与止损。")
+
+	return strings.Join(lines, "\n")
+}
+
+func formatMarketStreamErrorAlert(err error) string {
+	if err == nil {
+		return "⚠️ 行情数据流出现异常，系统正在自动重连。"
+	}
+
+	raw := strings.TrimSpace(err.Error())
+	lower := strings.ToLower(raw)
+
+	summary := "行情数据流出现异常，系统正在自动重连。"
+	detail := "连接恢复后会继续推送信号，请稍后再看一眼。"
+
+	switch {
+	case strings.Contains(lower, "decode market ws update"):
+		summary = "行情数据格式出现变化，系统已自动跳过异常片段并继续运行。"
+		detail = "无需手动处理；如果频繁出现，请升级到最新版本。"
+	case strings.Contains(lower, "dial market ws"):
+		summary = "行情连接暂时中断，系统正在自动重连。"
+		detail = "通常是网络抖动导致，恢复后会继续接收行情。"
+	case strings.Contains(lower, "read market ws"):
+		summary = "行情连接读取中断，系统正在自动重连。"
+		detail = "短暂断线后通常会自动恢复。"
+	}
+
+	return fmt.Sprintf("⚠️ 行情提醒\n%s\n说明：%s", summary, detail)
+}
+
+func clampConfidencePercent(confidence float64) float64 {
+	if confidence < 0 {
+		confidence = 0
+	}
+	if confidence > 1 {
+		confidence = 1
+	}
+	return confidence * 100
+}
+
+func humanizeStage(stage string) string {
+	switch strings.ToLower(strings.TrimSpace(stage)) {
+	case "signal":
+		return "新信号"
+	case "blocked":
+		return "风控拦截"
+	case "failed":
+		return "执行失败"
+	case "submitted", "live", "matched", "filled":
+		return "执行跟踪"
+	case "reconcile_pending":
+		return "待对账确认"
+	default:
+		trimmed := strings.TrimSpace(stage)
+		if trimmed == "" {
+			return "状态更新"
+		}
+		return trimmed
+	}
+}
+
+func humanizeAction(action string) string {
+	switch strings.ToUpper(strings.TrimSpace(action)) {
+	case "LONG", "BUY":
+		return "看多"
+	case "SHORT", "SELL":
+		return "看空"
+	default:
+		trimmed := strings.TrimSpace(action)
+		if trimmed == "" {
+			return "未知"
+		}
+		return trimmed
+	}
+}
+
+func humanizeReason(reason string) string {
+	switch strings.TrimSpace(reason) {
+	case "rank_flip_polymarket_leads_news_lag":
+		return "盘口领先关系发生反转（Polymarket 领先）"
+	case "":
+		return "未知原因"
+	default:
+		return strings.ReplaceAll(strings.TrimSpace(reason), "_", " ")
+	}
+}
+
+func humanizeSeverity(severity AnomalySeverity) string {
+	switch normalizeAnomalySeverity(string(severity)) {
+	case AnomalySeverityHigh:
+		return "高"
+	case AnomalySeverityMedium:
+		return "中"
+	case AnomalySeverityLow:
+		return "低"
+	default:
+		return "未知"
+	}
+}
+
+func readSignalMarketURL(metadata map[string]any) string {
+	if len(metadata) == 0 {
+		return ""
+	}
+	for _, key := range []string{"market_url", "marketUrl", "event_url", "eventUrl", "url"} {
+		raw, ok := metadata[key]
+		if !ok {
+			continue
+		}
+		value, ok := raw.(string)
+		if !ok {
+			continue
+		}
+		link := strings.TrimSpace(value)
+		if strings.HasPrefix(link, "https://") || strings.HasPrefix(link, "http://") {
+			return link
+		}
+	}
+	return ""
+}
+
+func formatAssetDisplay(label string, assetID string) string {
+	trimmedLabel := strings.TrimSpace(label)
+	trimmedAssetID := strings.TrimSpace(assetID)
+
+	if trimmedLabel == "" && trimmedAssetID == "" {
+		return "未知标的"
+	}
+	if trimmedLabel == "" || trimmedLabel == trimmedAssetID {
+		return shortenAssetID(trimmedAssetID)
+	}
+	if trimmedAssetID == "" {
+		return trimmedLabel
+	}
+	return fmt.Sprintf("%s (%s)", trimmedLabel, shortenAssetID(trimmedAssetID))
+}
+
+func shortenAssetID(assetID string) string {
+	trimmed := strings.TrimSpace(assetID)
+	if trimmed == "" {
+		return "未知标的"
+	}
+	if len(trimmed) <= 18 {
+		return trimmed
+	}
+	return fmt.Sprintf("%s...%s", trimmed[:10], trimmed[len(trimmed)-8:])
 }
 
 func signalSeverityFromMetadata(signal strategy.Signal) AnomalySeverity {

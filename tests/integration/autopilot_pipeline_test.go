@@ -195,6 +195,56 @@ func (s errorOnlyStream) Stream(_ context.Context, _ []string) (<-chan polymarke
 	return updates, errs
 }
 
+type burstSignalStream struct {
+	updates []polymarket.WSMarketUpdate
+}
+
+func (s burstSignalStream) Stream(_ context.Context, _ []string) (<-chan polymarket.WSMarketUpdate, <-chan error) {
+	updates := make(chan polymarket.WSMarketUpdate, len(s.updates))
+	errs := make(chan error)
+	for _, update := range s.updates {
+		updates <- update
+	}
+	close(updates)
+	close(errs)
+	return updates, errs
+}
+
+type alwaysSignalStrategy struct{}
+
+func (alwaysSignalStrategy) OnUpdate(update polymarket.WSMarketUpdate) []strategy.Signal {
+	return []strategy.Signal{{
+		ID:         fmt.Sprintf("dup-sig-%d", time.Now().UnixNano()),
+		AssetID:    update.AssetID,
+		AssetLabel: "TOK1",
+		Action:     "LONG",
+		Reason:     "rank_flip_polymarket_leads_news_lag",
+		Confidence: 0.01,
+		CreatedAt:  time.Now().UTC(),
+		Metadata: map[string]any{
+			"spread": 0.01,
+		},
+	}}
+}
+
+type linkSignalStrategy struct{}
+
+func (linkSignalStrategy) OnUpdate(update polymarket.WSMarketUpdate) []strategy.Signal {
+	return []strategy.Signal{{
+		ID:         fmt.Sprintf("link-sig-%d", time.Now().UnixNano()),
+		AssetID:    update.AssetID,
+		AssetLabel: "BTC",
+		Action:     "LONG",
+		Reason:     "rank_flip_polymarket_leads_news_lag",
+		Confidence: 0.37,
+		CreatedAt:  time.Now().UTC(),
+		Metadata: map[string]any{
+			"spread":     0.373,
+			"market_url": "https://polymarket.com/event/will-bitcoin-hit-1m-before-gta-vi-872",
+		},
+	}}
+}
+
 type severityStrategy struct {
 	spread float64
 }
@@ -433,8 +483,88 @@ func TestAutoPilotStreamErrorEmitsOpsAlert(t *testing.T) {
 		t.Fatalf("expected autopilot run success, got %v", err)
 	}
 
-	if !notifier.contains("market stream error") {
+	if !notifier.contains("行情提醒") {
 		t.Fatal("expected ops alert for market stream error")
+	}
+}
+
+func TestAutoPilotStreamErrorAlertIsHumanReadable(t *testing.T) {
+	store := &testStore{}
+	notifier := &collectingNotifier{}
+	streamErr := fmt.Errorf("decode market ws update: json: cannot unmarshal array into Go value of type struct { ... }")
+	autopilot := runtime.NewAutoPilot(runtime.AutoPilotConfig{
+		Stream:    errorOnlyStream{err: streamErr},
+		Store:     store,
+		Strategy:  fixedStrategy{},
+		Notifier:  notifier,
+		OpsAlerts: runtime.NewOpsAlertManager(notifier, time.Minute),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	if err := autopilot.Run(ctx, []string{"tok1"}); err != nil {
+		t.Fatalf("expected autopilot run success, got %v", err)
+	}
+
+	if !notifier.contains("行情数据格式出现变化") {
+		t.Fatal("expected human-readable market stream alert")
+	}
+	if notifier.contains("cannot unmarshal array into Go value") {
+		t.Fatal("expected stream alert to avoid raw parser internals")
+	}
+}
+
+func TestAutoPilotSignalNotificationIsHumanReadable(t *testing.T) {
+	store := &testStore{}
+	notifier := &collectingNotifier{}
+	autopilot := runtime.NewAutoPilot(runtime.AutoPilotConfig{
+		Stream:   &testStream{update: polymarket.WSMarketUpdate{AssetID: "tok1", Type: "book", Payload: []byte(`{"price":0.55}`)}},
+		Store:    store,
+		Strategy: fixedStrategy{},
+		Notifier: notifier,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	if err := autopilot.Run(ctx, []string{"tok1"}); err != nil {
+		t.Fatalf("expected autopilot run success, got %v", err)
+	}
+
+	if !notifier.contains("信号提醒") {
+		t.Fatal("expected readable signal header in notification")
+	}
+	if !notifier.contains("建议") {
+		t.Fatal("expected readable suggestion line in notification")
+	}
+	if notifier.contains("reason=") || notifier.contains("asset=") {
+		t.Fatal("expected notification text not to use raw key=value format")
+	}
+}
+
+func TestAutoPilotSignalNotificationIncludesMarketLinkWhenAvailable(t *testing.T) {
+	store := &testStore{}
+	notifier := &collectingNotifier{}
+	autopilot := runtime.NewAutoPilot(runtime.AutoPilotConfig{
+		Stream:   &testStream{update: polymarket.WSMarketUpdate{AssetID: "tok1", Type: "book", Payload: []byte(`{"price":0.55}`)}},
+		Store:    store,
+		Strategy: linkSignalStrategy{},
+		Notifier: notifier,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	if err := autopilot.Run(ctx, []string{"tok1"}); err != nil {
+		t.Fatalf("expected autopilot run success, got %v", err)
+	}
+
+	if !notifier.contains("查看市场") {
+		t.Fatal("expected market link line in signal notification")
+	}
+	if !notifier.contains("https://polymarket.com/event/will-bitcoin-hit-1m-before-gta-vi-872") {
+		t.Fatal("expected concrete polymarket event link in signal notification")
 	}
 }
 
@@ -465,8 +595,39 @@ func TestAutoPilotAnomalySeverityHighRecordedAndAlerted(t *testing.T) {
 	if !strings.Contains(metrics, `autopilot_anomaly_signals_total{severity="high"} 1`) {
 		t.Fatalf("expected high anomaly metric recorded, got metrics:\n%s", metrics)
 	}
-	if !notifier.contains("anomaly severity alert") {
+	if !notifier.contains("异常波动预警") {
 		t.Fatal("expected graded anomaly ops alert message")
+	}
+}
+
+func TestAutoPilotSignalNotificationsAreDedupedWithinWindow(t *testing.T) {
+	store := &testStore{}
+	notifier := &collectingNotifier{}
+	stream := burstSignalStream{updates: []polymarket.WSMarketUpdate{
+		{AssetID: "tok1", Type: "book", Payload: []byte(`{"price":0.51}`)},
+		{AssetID: "tok1", Type: "book", Payload: []byte(`{"price":0.52}`)},
+		{AssetID: "tok1", Type: "book", Payload: []byte(`{"price":0.53}`)},
+	}}
+
+	autopilot := runtime.NewAutoPilot(runtime.AutoPilotConfig{
+		Stream:   stream,
+		Store:    store,
+		Strategy: alwaysSignalStrategy{},
+		Notifier: notifier,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	if err := autopilot.Run(ctx, []string{"tok1"}); err != nil {
+		t.Fatalf("expected autopilot run success, got %v", err)
+	}
+
+	if store.signalCount != len(stream.updates) {
+		t.Fatalf("expected all signals persisted, got %d", store.signalCount)
+	}
+	if store.notifyCount != 1 {
+		t.Fatalf("expected duplicate signal notifications deduped to one send, got %d", store.notifyCount)
 	}
 }
 
@@ -492,7 +653,7 @@ func TestAutoPilotAnomalySeverityLowDoesNotAlertWhenMinIsMedium(t *testing.T) {
 		t.Fatalf("expected autopilot run success, got %v", err)
 	}
 
-	if notifier.contains("anomaly severity alert") {
+	if notifier.contains("异常波动预警") {
 		t.Fatal("expected low anomaly not to trigger graded ops alert when min severity is medium")
 	}
 }

@@ -3,6 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 
 	"polymarket-signal/internal/strategy"
@@ -181,5 +185,105 @@ func TestBuildLiveOrderKeyDeterministicBySignalAndMarket(t *testing.T) {
 	otherKey := buildLiveOrderKey("sig-100", "tok-2")
 	if otherKey == keyA {
 		t.Fatalf("expected different market to produce different key, got %q", otherKey)
+	}
+}
+
+func TestDefaultStrategyLinkUsesSearchQueryURL(t *testing.T) {
+	assetID := "105267568073659068217311993901927962476298440625043565106676088842803600775810"
+	want := "https://polymarket.com/search?query=" + url.QueryEscape(assetID)
+	if got := defaultStrategyLink(assetID); got != want {
+		t.Fatalf("expected search link %q, got %q", want, got)
+	}
+}
+
+func TestResolveStrategyAssetLinksFallsBackToSearchLink(t *testing.T) {
+	assetA := "asset-does-not-exist-a"
+	assetB := "asset-does-not-exist-b"
+	t.Setenv("ARB_ASSET_A_URL", "")
+	t.Setenv("ARB_ASSET_B_URL", "")
+	t.Setenv("POLY_GAMMA_URL", "https://gamma-api.polymarket.com")
+
+	links := resolveStrategyAssetLinks(assetA, assetB)
+	wantA := "https://polymarket.com/search?query=" + url.QueryEscape(assetA)
+	wantB := "https://polymarket.com/search?query=" + url.QueryEscape(assetB)
+
+	if links[assetA] != wantA {
+		t.Fatalf("expected asset A fallback search link %q, got %q", wantA, links[assetA])
+	}
+	if links[assetB] != wantB {
+		t.Fatalf("expected asset B fallback search link %q, got %q", wantB, links[assetB])
+	}
+}
+
+func TestResolveStrategyAssetLinksKeepsConfiguredURLWithoutReachabilityCheck(t *testing.T) {
+	assetA := "asset-a"
+	assetB := "asset-b"
+	configuredA := "https://example.invalid/market-a"
+	t.Setenv("ARB_ASSET_A_URL", configuredA)
+	t.Setenv("ARB_ASSET_B_URL", "")
+	t.Setenv("POLY_GAMMA_URL", "https://gamma-api.polymarket.com")
+
+	links := resolveStrategyAssetLinks(assetA, assetB)
+	if links[assetA] != configuredA {
+		t.Fatalf("expected configured URL to be kept, got %q", links[assetA])
+	}
+}
+
+func TestChoosePolymarketEventSlugPrefersEventSlug(t *testing.T) {
+	marketSlug := "will-bitcoin-hit-1m-before-gta-vi-872"
+	eventSlug := "what-will-happen-before-gta-vi"
+
+	chosen := choosePolymarketEventSlug(
+		marketSlug,
+		[]gammaMarketEvent{{Slug: eventSlug}},
+	)
+
+	if chosen != eventSlug {
+		t.Fatalf("expected event slug %q, got %q", eventSlug, chosen)
+	}
+}
+
+func TestChoosePolymarketEventSlugFallsBackToMarketSlugWhenEventMissing(t *testing.T) {
+	marketSlug := "bitboy-convicted"
+	chosen := choosePolymarketEventSlug(marketSlug, nil)
+	if chosen != marketSlug {
+		t.Fatalf("expected market slug fallback %q, got %q", marketSlug, chosen)
+	}
+}
+
+func TestResolvePolymarketEventURLUsesBrowserHeadersAndMarketSlugFallback(t *testing.T) {
+	assetID := "token-id-1"
+	marketSlug := "will-bitcoin-hit-1m-before-gta-vi-872"
+
+	gammaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/markets" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.URL.Query().Get("clob_token_ids"); got != assetID {
+			t.Fatalf("expected clob_token_ids query %q, got %q", assetID, got)
+		}
+		if got := r.Header.Get("User-Agent"); !strings.Contains(got, "polymarket-signal-autopilot") {
+			http.Error(w, "missing user agent", http.StatusForbidden)
+			return
+		}
+		if got := r.Header.Get("Origin"); got != "https://polymarket.com" {
+			http.Error(w, "missing origin", http.StatusForbidden)
+			return
+		}
+		if got := r.Header.Get("Referer"); got != "https://polymarket.com/" {
+			http.Error(w, "missing referer", http.StatusForbidden)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(fmt.Sprintf(`[{"slug":"%s","events":[]}]`, marketSlug)))
+	}))
+	defer gammaServer.Close()
+
+	got := resolvePolymarketEventURL(gammaServer.URL, assetID)
+	want := "https://polymarket.com/event/" + marketSlug
+	if got != want {
+		t.Fatalf("expected resolved market URL %q, got %q", want, got)
 	}
 }

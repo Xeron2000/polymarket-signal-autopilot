@@ -29,12 +29,14 @@ type RankShiftConfig struct {
 	Cooldown    time.Duration
 	Now         func() time.Time
 	TargetLabel string
+	AssetLinks  map[string]string
 }
 
 type RankShiftStrategy struct {
 	cfg          RankShiftConfig
 	Now          func() time.Time
 	prices       map[string]float64
+	assetLinks   map[string]string
 	leader       string
 	lastSignalAt time.Time
 }
@@ -52,9 +54,10 @@ func NewRankShiftStrategy(cfg RankShiftConfig) *RankShiftStrategy {
 	}
 
 	return &RankShiftStrategy{
-		cfg:    cfg,
-		Now:    now,
-		prices: make(map[string]float64),
+		cfg:        cfg,
+		Now:        now,
+		prices:     make(map[string]float64),
+		assetLinks: sanitizeAssetLinks(cfg.AssetLinks),
 	}
 }
 
@@ -110,6 +113,15 @@ func (s *RankShiftStrategy) OnUpdate(update polymarket.WSMarketUpdate) []Signal 
 		confidence = 1
 	}
 
+	metadata := map[string]any{
+		"old_leader": oldLeader,
+		"new_leader": newLeader,
+		"spread":     diff,
+	}
+	if marketURL, ok := s.assetLinks[oldLeader]; ok && strings.TrimSpace(marketURL) != "" {
+		metadata["market_url"] = strings.TrimSpace(marketURL)
+	}
+
 	return []Signal{{
 		ID:         fmt.Sprintf("rankshift-%d", now.UnixNano()),
 		AssetID:    oldLeader,
@@ -118,12 +130,27 @@ func (s *RankShiftStrategy) OnUpdate(update polymarket.WSMarketUpdate) []Signal 
 		Reason:     "rank_flip_polymarket_leads_news_lag",
 		Confidence: confidence,
 		CreatedAt:  now,
-		Metadata: map[string]any{
-			"old_leader": oldLeader,
-			"new_leader": newLeader,
-			"spread":     diff,
-		},
+		Metadata:   metadata,
 	}}
+}
+
+func sanitizeAssetLinks(raw map[string]string) map[string]string {
+	if len(raw) == 0 {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(raw))
+	for key, value := range raw {
+		assetID := strings.TrimSpace(key)
+		if assetID == "" {
+			continue
+		}
+		link := strings.TrimSpace(value)
+		if link == "" {
+			continue
+		}
+		out[assetID] = link
+	}
+	return out
 }
 
 func extractPrice(raw []byte) (float64, bool) {

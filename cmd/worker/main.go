@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -91,6 +92,7 @@ func main() {
 		AnomalySeverityMedium:   anomalySeverityMedium,
 		AnomalySeverityHigh:     anomalySeverityHigh,
 		AnomalyAlertMinSeverity: anomalyAlertMinSeverity,
+		SignalNotifyCooldown:    parseDuration("SIGNAL_NOTIFY_COOLDOWN", 2*time.Minute),
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -138,6 +140,7 @@ func buildStrategy(assetIDs []string) *strategy.RankShiftStrategy {
 	flipSpread := parseFloat("ARB_FLIP_SPREAD", 0.05)
 	cooldown := parseDuration("ARB_COOLDOWN_SECONDS", 5*time.Minute)
 	targetLabel := getenv("ARB_TARGET_LABEL", strings.ToUpper(assetA))
+	assetLinks := resolveStrategyAssetLinks(assetA, assetB)
 
 	return strategy.NewRankShiftStrategy(strategy.RankShiftConfig{
 		AssetA:      assetA,
@@ -145,7 +148,174 @@ func buildStrategy(assetIDs []string) *strategy.RankShiftStrategy {
 		FlipSpread:  flipSpread,
 		Cooldown:    cooldown,
 		TargetLabel: targetLabel,
+		AssetLinks:  assetLinks,
 	})
+}
+
+func resolveStrategyAssetLinks(assetA string, assetB string) map[string]string {
+	links := make(map[string]string, 2)
+
+	assetA = strings.TrimSpace(assetA)
+	assetB = strings.TrimSpace(assetB)
+
+	if assetA != "" {
+		if configured := strings.TrimSpace(os.Getenv("ARB_ASSET_A_URL")); configured != "" {
+			links[assetA] = configured
+		}
+	}
+	if assetB != "" {
+		if configured := strings.TrimSpace(os.Getenv("ARB_ASSET_B_URL")); configured != "" {
+			links[assetB] = configured
+		}
+	}
+
+	gammaBase := strings.TrimSpace(getenv("POLY_GAMMA_URL", polymarket.DefaultGammaBaseURL))
+	if gammaBase == "" {
+		gammaBase = polymarket.DefaultGammaBaseURL
+	}
+
+	if assetA != "" && links[assetA] == "" {
+		if resolved := resolvePolymarketEventURL(gammaBase, assetA); resolved != "" {
+			links[assetA] = resolved
+		}
+	}
+	if assetB != "" && links[assetB] == "" {
+		if resolved := resolvePolymarketEventURL(gammaBase, assetB); resolved != "" {
+			links[assetB] = resolved
+		}
+	}
+
+	if assetA != "" && links[assetA] == "" {
+		links[assetA] = defaultStrategyLink(assetA)
+	}
+	if assetB != "" && links[assetB] == "" {
+		links[assetB] = defaultStrategyLink(assetB)
+	}
+
+	return links
+}
+
+const (
+	polymarketLookupUserAgent = "polymarket-signal-autopilot/1.0"
+	polymarketLookupOrigin    = "https://polymarket.com"
+	polymarketLookupReferer   = "https://polymarket.com/"
+)
+
+func resolvePolymarketEventURL(gammaBase string, assetID string) string {
+	assetID = strings.TrimSpace(assetID)
+	if assetID == "" {
+		return ""
+	}
+
+	base := strings.TrimRight(strings.TrimSpace(gammaBase), "/")
+	if base == "" {
+		base = polymarket.DefaultGammaBaseURL
+	}
+
+	endpoint := fmt.Sprintf("%s/markets?clob_token_ids=%s&limit=1", base, url.QueryEscape(assetID))
+	client := &http.Client{Timeout: 3 * time.Second}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, endpoint, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", polymarketLookupUserAgent)
+	req.Header.Set("Origin", polymarketLookupOrigin)
+	req.Header.Set("Referer", polymarketLookupReferer)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return ""
+	}
+
+	var payload []struct {
+		Slug   string             `json:"slug"`
+		Events []gammaMarketEvent `json:"events"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return ""
+	}
+	if len(payload) == 0 {
+		return ""
+	}
+
+	chosenSlug := choosePolymarketEventSlug(payload[0].Slug, payload[0].Events)
+	if chosenSlug == "" {
+		return ""
+	}
+
+	return fmt.Sprintf("https://polymarket.com/event/%s", chosenSlug)
+}
+
+type gammaMarketEvent struct {
+	Slug string `json:"slug"`
+}
+
+func choosePolymarketEventSlug(marketSlug string, events []gammaMarketEvent) string {
+	for _, event := range events {
+		slug := strings.TrimSpace(event.Slug)
+		if slug != "" {
+			return slug
+		}
+	}
+	return strings.TrimSpace(marketSlug)
+}
+
+func defaultStrategyLink(assetID string) string {
+	trimmed := strings.TrimSpace(assetID)
+	if trimmed == "" {
+		return "https://polymarket.com/search"
+	}
+	return fmt.Sprintf("https://polymarket.com/search?query=%s", url.QueryEscape(trimmed))
+}
+
+func isLikelyReachableURL(raw string) bool {
+	target := strings.TrimSpace(raw)
+	if target == "" {
+		return false
+	}
+
+	parsed, err := url.Parse(target)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return false
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return false
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodHead, target, nil)
+	if err != nil {
+		return false
+	}
+
+	resp, err := client.Do(req)
+	if err == nil {
+		defer resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+			return true
+		}
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			return false
+		}
+	}
+
+	getReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, target, nil)
+	if err != nil {
+		return false
+	}
+	getResp, err := client.Do(getReq)
+	if err != nil {
+		return false
+	}
+	defer getResp.Body.Close()
+
+	return getResp.StatusCode >= 200 && getResp.StatusCode < 400
 }
 
 func buildNotifier() runtime.AlertNotifier {
