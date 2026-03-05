@@ -8,3 +8,5 @@ bin/
 dist/
 coverage/
 *.log
+
+coverage*
