@@ -91,10 +91,12 @@ Optional env:
 
 - `POLY_WS_URL` (defaults to official market WS URL)
 - `ARB_ASSET_A` (defaults first asset in `POLY_ASSET_IDS`)
+- `ARB_ASSET_A_URL` / `ARB_ASSET_B_URL` (optional; override clickable market links in Telegram)
 - `ARB_TARGET_LABEL` (used in notifications)
 - `ARB_FLIP_SPREAD` (default `0.05`)
 - `ARB_COOLDOWN_SECONDS` (default `300`)
 - `TG_BOT_TOKEN` + `TG_CHAT_ID` (enable Telegram notifications)
+- `SIGNAL_NOTIFY_COOLDOWN` (default `2m`, dedupe repeated signal notifications)
 - `WORKER_OPS_ADDR` (default `:9091`, worker ops server)
 - `OPS_ALERT_COOLDOWN` (default `2m`, dedupe for operational alerts)
 - `ORDER_RECONCILE_MAX_ATTEMPTS` (default `3`)
