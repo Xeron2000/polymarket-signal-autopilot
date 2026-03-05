@@ -1,0 +1,10 @@
+.ace-tool/
+
+.env
+.env.*
+!.env.example
+
+bin/
+dist/
+coverage/
+*.log

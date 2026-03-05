@@ -1,0 +1,75 @@
+name: polymarket-signal
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-polysignal}"
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-polysignal}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    image: postgres:16-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-polysignal}?sslmode=disable"
+    volumes:
+      - ./migrations:/migrations:ro
+    command:
+      - /bin/sh
+      - -ec
+      - "for file in /migrations/*.sql; do echo \"Applying migration: $$file\"; psql \"$$DATABASE_URL\" -v ON_ERROR_STOP=1 -f \"$$file\"; done; echo \"All migrations applied.\""
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      API_ADDR: ":8080"
+      POLY_GAMMA_URL: "${POLY_GAMMA_URL:-https://gamma-api.polymarket.com}"
+      POLY_CLOB_URL: "${POLY_CLOB_URL:-https://clob.polymarket.com}"
+    ports:
+      - "${API_PORT:-8080}:8080"
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-polysignal}?sslmode=disable"
+      POLY_ASSET_IDS: "${POLY_ASSET_IDS:-TOKEN_ID_1,TOKEN_ID_2}"
+      ARB_ASSET_A: "${ARB_ASSET_A:-TOKEN_ID_1}"
+      ARB_ASSET_B: "${ARB_ASSET_B:-TOKEN_ID_2}"
+      POLY_WS_URL: "${POLY_WS_URL:-wss://ws-subscriptions-clob.polymarket.com/ws/market}"
+      POLY_CLOB_URL: "${POLY_CLOB_URL:-https://clob.polymarket.com}"
+      WORKER_OPS_ADDR: ":9091"
+      AUTO_EXECUTE: "${AUTO_EXECUTE:-false}"
+      TG_BOT_TOKEN: "${TG_BOT_TOKEN:-}"
+      TG_CHAT_ID: "${TG_CHAT_ID:-}"
+    ports:
+      - "${WORKER_OPS_PORT:-9091}:9091"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
